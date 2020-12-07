@@ -210,6 +210,7 @@ func (tr *Transport) RefreshKeys() (err error) {
 				kr = csr.NewKeyRequest()
 			}
 
+			// 创建新的私钥
 			err = tr.Provider.Generate(kr.Algo(), kr.Size())
 			if err != nil {
 				log.Debugf("failed to generate key: %v", err)
@@ -218,9 +219,11 @@ func (tr *Transport) RefreshKeys() (err error) {
 		}
 	}
 
+	// 证书有效期
 	lifespan := tr.Lifespan()
 	if lifespan < tr.Before {
 		log.Debugf("transport's certificate is out of date (lifespan %s)", lifespan)
+		// 从填写的 request 结构体读取 CSR 配置
 		req, err := tr.Provider.CertificateRequest(tr.Identity.Request)
 		if err != nil {
 			log.Debugf("couldn't get a CSR: %v", err)
@@ -231,6 +234,7 @@ func (tr *Transport) RefreshKeys() (err error) {
 		}
 
 		log.Debug("requesting certificate from CA")
+		// 调用 CA
 		cert, err := tr.CA.SignCSR(req)
 		if err != nil {
 			if tr.Provider.SignalFailure(err) {

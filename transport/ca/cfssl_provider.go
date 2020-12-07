@@ -270,14 +270,17 @@ func NewCFSSLProvider(id *core.Identity, defaultRemote client.Remote) (*CFSSL, e
 		cap.Profile = cfssl["profile"]
 
 		if cap.DefaultRemote == nil {
+			// 不存在则 cert, err = nil
 			cert, err := helpers.LoadClientCertificate(cfssl["mutual-tls-cert"], cfssl["mutual-tls-key"])
 			if err != nil {
 				return nil, err
 			}
+			// 不存在则值为 nil
 			remoteCAs, err := helpers.LoadPEMCertPool(cfssl["tls-remote-ca"])
 			if err != nil {
 				return nil, err
 			}
+			// 与 cfssl 通信的客户端
 			cap.DefaultRemote = client.NewServerTLS(cfssl["remote"], helpers.CreateTLSConfig(remoteCAs, cert))
 		}
 
