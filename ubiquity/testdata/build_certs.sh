@@ -27,9 +27,59 @@
 
 set -e
 
+assert_signature_algorithm() {
+    local cert="$1" expected="$2" details
+    if ! details=$(openssl x509 -in "$cert" -noout -text); then
+        echo "ERROR: unable to parse $cert" >&2
+        return 1
+    fi
+    case "$details" in
+        *"Signature Algorithm: $expected"*) ;;
+        *)
+            echo "ERROR: $cert was not signed with $expected" >&2
+            return 1
+            ;;
+    esac
+}
+
+write_sha1_config() {
+    cat >"$1" <<'CNFEOF'
+[ req ]
+distinguished_name = dn
+[ dn ]
+[ openssl_init ]
+providers = provider_sect
+alg_section = algorithm_sect
+[ provider_sect ]
+default = default_sect
+legacy = legacy_sect
+[ default_sect ]
+activate = 1
+[ legacy_sect ]
+activate = 1
+[ algorithm_sect ]
+rh_allow_sha1_signatures = yes
+CNFEOF
+}
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TESTDATA="${SCRIPT_DIR}"
 cd "$TESTDATA"
+
+# Probe SHA-1 before replacing any managed fixture. Some systems reject SHA-1
+# signing even when explicitly enabled in OpenSSL's configuration.
+SHA1_PREFLIGHT_DIR=$(mktemp -d /tmp/cfssl_ubiquity_sha1_preflight_XXXXXX)
+trap 'rm -rf -- "$SHA1_PREFLIGHT_DIR"' EXIT
+write_sha1_config "$SHA1_PREFLIGHT_DIR/openssl.cnf"
+openssl genrsa -out "$SHA1_PREFLIGHT_DIR/rsa1024.key" 1024 2>/dev/null
+if ! OPENSSL_CONF="$SHA1_PREFLIGHT_DIR/openssl.cnf" openssl req -new -x509 \
+        -key "$SHA1_PREFLIGHT_DIR/rsa1024.key" \
+        -out "$SHA1_PREFLIGHT_DIR/rsa1024sha1.pem" \
+        -days 1 -sha1 -subj "/CN=CFSSL SHA-1 preflight" 2>/dev/null; then
+    echo "ERROR: SHA-1 signing is blocked by system policy; no fixtures were regenerated" >&2
+    exit 1
+fi
+assert_signature_algorithm "$SHA1_PREFLIGHT_DIR/rsa1024sha1.pem" sha1
 
 echo "=== Regenerating ubiquity/testdata certificates ==="
 echo "    Output directory: $TESTDATA"
@@ -49,39 +99,25 @@ echo "--- rsa1024sha1.pem (RSA-1024, SHA-1, expires 2034) ---"
 openssl genrsa $RSA_TRADITIONAL -out rsa1024.key 1024 2>/dev/null
 
 SHA1_CNF=$(mktemp /tmp/ubiq_sha1_XXXXXX.cnf)
-cat > "$SHA1_CNF" << 'CNFEOF'
-[ req ]
-distinguished_name = dn
-[ dn ]
-[ openssl_init ]
-providers = provider_sect
-alg_section = algorithm_sect
-[ provider_sect ]
-default = default_sect
-legacy = legacy_sect
-[ default_sect ]
-activate = 1
-[ legacy_sect ]
-activate = 1
-[ algorithm_sect ]
-rh_allow_sha1_signatures = yes
-CNFEOF
+SHA1_OUTPUT=$(mktemp /tmp/rsa1024_sha1_XXXXXX.pem)
+write_sha1_config "$SHA1_CNF"
 
-# Try SHA-1; fall back to SHA-256 if the system policy blocks it entirely.
-if OPENSSL_CONF="$SHA1_CNF" openssl req -new -x509 \
-        -key rsa1024.key -out rsa1024sha1.pem \
+# Fail rather than substitute SHA-256 if system policy blocks SHA-1.
+if ! OPENSSL_CONF="$SHA1_CNF" openssl req -new -x509 \
+        -key rsa1024.key -out "$SHA1_OUTPUT" \
         -days 2920 -sha1 \
         -subj "/CN=rsa1024-sha1/O=CFSSL Ubiquity Test" 2>/dev/null; then
-    echo "  rsa1024sha1.pem: SHA-1 signed"
-else
-    echo "  WARNING: SHA-1 blocked by system policy; falling back to SHA-256."
-    echo "  TestCertHashPriority / TestSHA2Homogeneity may need adjustment."
-    openssl req -new -x509 \
-        -key rsa1024.key -out rsa1024sha1.pem \
-        -days 2920 -sha256 \
-        -subj "/CN=rsa1024-sha1/O=CFSSL Ubiquity Test" 2>/dev/null
+    rm -f "$SHA1_CNF" "$SHA1_OUTPUT"
+    echo "ERROR: SHA-1 signing is blocked by system policy; rsa1024sha1.pem was not regenerated" >&2
+    exit 1
 fi
+if ! assert_signature_algorithm "$SHA1_OUTPUT" sha1; then
+    rm -f "$SHA1_CNF" "$SHA1_OUTPUT"
+    exit 1
+fi
+mv "$SHA1_OUTPUT" rsa1024sha1.pem
 rm -f "$SHA1_CNF"
+echo "  rsa1024sha1.pem: SHA-1 signed"
 openssl x509 -noout -enddate -in rsa1024sha1.pem | sed 's/^/  /'
 
 # ── rsa2048sha2.pem ──────────────────────────────────────────────────────────

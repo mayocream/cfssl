@@ -4,16 +4,17 @@
 # Run from the repository root:
 #   bash bundler/testdata/build_certs.sh
 #
-# Requirements: openssl (3.x recommended), cfssl + cfssljson in PATH.
+# Requirements: openssl (3.x recommended). cfssl + cfssljson are optional;
+# when absent, the script generates the same hierarchy with OpenSSL.
 # All existing files in bundler/testdata/ that this script touches are
-# overwritten in-place; files it does not manage (ca-bundle.pem,
-# int-bundle.pem, nss.pem, osx.pem, froyo.pem, etc.) are left alone.
+# overwritten in-place; files it does not manage (nss.pem, osx.pem,
+# froyo.pem, etc.) are left alone.
 #
 # Certificate hierarchy produced
 # ───────────────────────────────
 #   ca.pem  (RSA-2048, self-signed, SHA-256, 20-year)
 #     └─ inter-L1.pem          (RSA-4096, pathlen:1, SHA-256, 10-year)
-#     │    └─ inter-L2.pem     (ECDSA-384, pathlen:0, SHA-256, 10-year)
+#     │    └─ inter-L2.pem     (ECDSA-384, pathlen:0, SHA-512, 10-year)
 #     │         ├─ cfssl-leaf-ecdsa256.pem
 #     │         ├─ cfssl-leaf-ecdsa384.pem
 #     │         ├─ cfssl-leaf-ecdsa521.pem
@@ -47,6 +48,72 @@ require_cmd() {
 }
 require_cmd openssl
 
+assert_signature_algorithm() {
+    local cert="$1" expected="$2" details
+    if ! details=$(openssl x509 -in "$cert" -noout -text); then
+        echo "ERROR: unable to parse $cert" >&2
+        return 1
+    fi
+    case "$details" in
+        *"Signature Algorithm: $expected"*) ;;
+        *)
+            echo "ERROR: $cert was not signed with $expected" >&2
+            return 1
+            ;;
+    esac
+}
+
+assert_pathlen_zero() {
+    local cert="$1" details
+    if ! details=$(openssl x509 -in "$cert" -noout -text); then
+        echo "ERROR: unable to parse $cert" >&2
+        return 1
+    fi
+    case "$details" in
+        *"CA:TRUE, pathlen:0"*|*"CA:TRUE, pathlen: 0"*) ;;
+        *)
+            echo "ERROR: $cert is missing the CA pathlen:0 constraint" >&2
+            return 1
+            ;;
+    esac
+}
+
+write_sha1_config() {
+    cat >"$1" <<'CONFEOF'
+openssl_conf = openssl_init
+
+[openssl_init]
+alg_section = evp_properties
+
+[evp_properties]
+rh_allow_sha1_signatures = yes
+default_properties = ""
+CONFEOF
+}
+
+# Probe SHA-1 before replacing any managed fixture. Some systems reject SHA-1
+# signing even when explicitly enabled in OpenSSL's configuration.
+SHA1_PREFLIGHT_DIR=$(mktemp -d /tmp/cfssl_sha1_preflight_XXXXXX)
+trap 'rm -rf -- "$SHA1_PREFLIGHT_DIR"' EXIT
+write_sha1_config "$SHA1_PREFLIGHT_DIR/openssl.cnf"
+openssl genrsa -out "$SHA1_PREFLIGHT_DIR/ca.key" 2048 2>/dev/null
+openssl req -new -x509 -key "$SHA1_PREFLIGHT_DIR/ca.key" \
+    -out "$SHA1_PREFLIGHT_DIR/ca.pem" -days 1 -sha256 \
+    -subj "/CN=CFSSL SHA-1 preflight CA" 2>/dev/null
+openssl genrsa -out "$SHA1_PREFLIGHT_DIR/intermediate.key" 2048 2>/dev/null
+openssl req -new -key "$SHA1_PREFLIGHT_DIR/intermediate.key" \
+    -out "$SHA1_PREFLIGHT_DIR/intermediate.csr" \
+    -subj "/CN=CFSSL SHA-1 preflight intermediate" 2>/dev/null
+if ! OPENSSL_CONF="$SHA1_PREFLIGHT_DIR/openssl.cnf" openssl x509 -req \
+        -in "$SHA1_PREFLIGHT_DIR/intermediate.csr" \
+        -CA "$SHA1_PREFLIGHT_DIR/ca.pem" -CAkey "$SHA1_PREFLIGHT_DIR/ca.key" \
+        -CAserial "$SHA1_PREFLIGHT_DIR/ca.srl" -CAcreateserial \
+        -out "$SHA1_PREFLIGHT_DIR/intermediate.pem" -days 1 -sha1 2>/dev/null; then
+    echo "ERROR: SHA-1 signing is blocked by system policy; no fixtures were regenerated" >&2
+    exit 1
+fi
+assert_signature_algorithm "$SHA1_PREFLIGHT_DIR/intermediate.pem" sha1
+
 # OpenSSL 3.x changed the default RSA key output format from traditional
 # PKCS#1 (BEGIN RSA PRIVATE KEY) to PKCS#8 (BEGIN PRIVATE KEY).
 # cfssl serialises RSA keys back in PKCS#1 format when marshalling a Bundle
@@ -70,7 +137,7 @@ write_ca_config() {
       "intermediate-l2": {
         "usages": ["cert sign","crl sign"],
         "expiry": "87600h",
-        "ca_constraint": {"is_ca": true, "max_path_len": 0}
+        "ca_constraint": {"is_ca": true, "max_path_len": 0, "max_path_len_zero": true}
       },
       "leaf": {
         "usages": ["signing","key encipherment","server auth"],
@@ -269,9 +336,9 @@ echo "  inter-L1-expired.pem written"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. inter-L1-sha1  (SHA-1 signed — intentional for deprecation tests)
-#    openssl 3.x refuses SHA-1 by default; we use -provider-path / legacy
-#    or force it via OPENSSL_CONF override.  If SHA-1 signing is blocked by
-#    system policy the script will warn but continue.
+#    openssl 3.x refuses SHA-1 by default; we force it via an OPENSSL_CONF
+#    override. If system policy still blocks SHA-1, regeneration fails rather
+#    than writing a certificate with different semantics under this filename.
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "--- 4. inter-L1-sha1 (SHA-1 signed, intentional) ---"
@@ -287,30 +354,25 @@ EXTEOF
 
 # Try with a temporary openssl.cnf that re-enables SHA-1 signing
 TMPCONF=$(mktemp /tmp/openssl_XXXXXX.cnf)
-cat >"$TMPCONF" <<'CONFEOF'
-openssl_conf = openssl_init
+SHA1_OUTPUT=$(mktemp /tmp/inter_L1_sha1_XXXXXX.pem)
+write_sha1_config "$TMPCONF"
 
-[openssl_init]
-alg_section = evp_properties
-
-[evp_properties]
-rh_allow_sha1_signatures = yes
-default_properties = ""
-CONFEOF
-
-if OPENSSL_CONF="$TMPCONF" openssl x509 -req -in inter-L1.csr \
+if ! OPENSSL_CONF="$TMPCONF" openssl x509 -req -in inter-L1.csr \
         -CA ca.pem -CAkey ca.key -CAcreateserial \
-        -out inter-L1-sha1.pem \
+        -out "$SHA1_OUTPUT" \
         -days 3650 -sha1 \
         -extfile "$extfile_sha1" -extensions ext 2>/dev/null; then
-    echo "  inter-L1-sha1.pem written (SHA-1)"
-else
-    echo "  WARNING: SHA-1 signing blocked by system policy."
-    echo "  Falling back to a SHA-256 cert for inter-L1-sha1.pem."
-    echo "  SHA-1 deprecation tests may behave differently."
-    openssl_sign_ca ca.pem ca.key inter-L1.csr inter-L1-sha1.pem 3650 sha256 1
+    rm -f "$extfile_sha1" "$TMPCONF" "$SHA1_OUTPUT"
+    echo "ERROR: SHA-1 signing is blocked by system policy; inter-L1-sha1.pem was not regenerated" >&2
+    exit 1
 fi
+if ! assert_signature_algorithm "$SHA1_OUTPUT" sha1; then
+    rm -f "$extfile_sha1" "$TMPCONF" "$SHA1_OUTPUT"
+    exit 1
+fi
+mv "$SHA1_OUTPUT" inter-L1-sha1.pem
 rm -f "$extfile_sha1" "$TMPCONF"
+echo "  inter-L1-sha1.pem written (SHA-1)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. inter-L2  (ECDSA-384, pathlen:0, signed by inter-L1)
@@ -336,8 +398,11 @@ else
     openssl ecparam -name secp384r1 -genkey -noout -out inter-L2.key 2>/dev/null
     openssl req -new -key inter-L2.key -out inter-L2.csr \
         -subj "/CN=CFSSL TEST Intermediate L2/O=CFSSL Test/OU=Test"
-    openssl_sign_ca inter-L1.pem inter-L1.key inter-L2.csr inter-L2.pem 3650 sha256 0
+    openssl_sign_ca inter-L1.pem inter-L1.key inter-L2.csr inter-L2.pem 3650 sha512 0
 fi
+
+assert_pathlen_zero inter-L2.pem
+assert_signature_algorithm inter-L2.pem sha512
 
 echo "  inter-L2.pem, inter-L2.key, inter-L2.csr written"
 
@@ -387,8 +452,8 @@ gen_leaf_rsa   3072            rsa3072
 
 # cfssl-leaf-rsa4096 is intentionally a sub-CA (CA:TRUE, pathlen:0) signed by inter-L2.
 # This means the chain root→inter-L1(pathlen:1)→inter-L2(pathlen:0)→leafRSA4096(pathlen:0)
-# is itself valid, but appending cfssl-leaflet-rsa4096 below it produces a chain where
-# inter-L1's pathlen:1 constraint is violated (2 CAs below it: inter-L2 + leafRSA4096).
+# is valid when leafRSA4096 is the target. Appending cfssl-leaflet-rsa4096 makes
+# leafRSA4096 an intermediate and violates inter-L2's pathlen:0 constraint.
 # Tests that bundle leafRSA4096 as the submitted cert still get chain length 3
 # (leafRSA4096 + inter-L2 + inter-L1) which is correct.
 openssl genrsa $RSA_TRADITIONAL -out cfssl-leaf-rsa4096.key 4096 2>/dev/null
@@ -402,8 +467,8 @@ echo "  cfssl-leaf-rsa4096.pem written (CA:TRUE, pathlen:0)"
 # 8. cfssl-leaflet-rsa4096
 #    A true leaf signed by cfssl-leaf-rsa4096 (which is itself a sub-CA).
 #    Without leafRSA4096 in the pool → error 1220 UnknownAuthority (signer unknown).
-#    With leafRSA4096 added as extraIntermediates → chain is found but inter-L1's
-#    pathlen:1 is violated by having 2 CAs (inter-L2 + leafRSA4096) below it →
+#    With leafRSA4096 added as extraIntermediates → chain is found but inter-L2's
+#    pathlen:0 is violated by having leafRSA4096 below it →
 #    error 1213 TooManyIntermediates.
 # ══════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -666,7 +731,7 @@ echo "  self-signed.pem written"
 # ══════════════════════════════════════════════════════════════════════════════
 rm -f ca-config.json ca.srl inter-L1.srl inter-L2.srl \
       cfssl-leaf-rsa4096.srl client-auth/root.srl client-auth/int.srl \
-      *.srl 2>/dev/null || true
+      ./*.srl 2>/dev/null || true
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary verification
