@@ -30,9 +30,13 @@
 
 set -e
 
+SERIAL_DIR=$(mktemp -d /tmp/api_serial_XXXXXX)
+trap 'rm -rf "$SERIAL_DIR"' EXIT
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TESTDATA="${SCRIPT_DIR}"
 cd "$TESTDATA"
+rm -f ca-bundle.srl int-bundle.srl inter.srl
 
 echo "=== Regenerating api/testdata certificates ==="
 echo "    Output directory: $TESTDATA"
@@ -78,10 +82,10 @@ openssl req -new -key inter.key -out inter.csr \
     2>/dev/null
 
 openssl x509 -req -in inter.csr -CA ca-bundle.pem -CAkey ca_key.pem \
-    -CAcreateserial -out int-bundle.pem \
+    -CAserial "$SERIAL_DIR/root.srl" -CAcreateserial -out int-bundle.pem \
     -days 3650 -sha256 -extfile "$INTER_EXT" 2>/dev/null
 
-rm -f "$INTER_EXT" inter.csr ca-bundle.srl
+rm -f "$INTER_EXT" inter.csr
 openssl x509 -noout -subject -issuer -enddate -in int-bundle.pem | sed 's/^/  /'
 
 # ── 3. leaf.pem + leaf.key ──────────────────────────────────────────────────
@@ -104,10 +108,10 @@ openssl req -new -key leaf.key -out leaf.csr \
     2>/dev/null
 
 openssl x509 -req -in leaf.csr -CA int-bundle.pem -CAkey inter.key \
-    -CAcreateserial -out leaf.pem \
+    -CAserial "$SERIAL_DIR/intermediate.srl" -CAcreateserial -out leaf.pem \
     -days 3650 -sha256 -extfile "$LEAF_EXT" 2>/dev/null
 
-rm -f "$LEAF_EXT" leaf.csr inter.srl
+rm -f "$LEAF_EXT" leaf.csr
 
 openssl x509 -noout -subject -issuer -enddate -in leaf.pem | sed 's/^/  /'
 
