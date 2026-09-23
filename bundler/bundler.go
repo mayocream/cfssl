@@ -72,12 +72,14 @@ type Bundler struct {
 
 type options struct {
 	keyUsages []x509.ExtKeyUsage
+	dialTLS   func(*net.Dialer, string, string, *tls.Config) (*tls.Conn, error)
 }
 
 var defaultOptions = options{
 	keyUsages: []x509.ExtKeyUsage{
 		x509.ExtKeyUsageAny,
 	},
+	dialTLS: tls.DialWithDialer,
 }
 
 // An Option sets options such as allowed key usages, etc.
@@ -285,7 +287,11 @@ func (b *Bundler) BundleFromRemote(serverName, ip string, flavor BundleFlavor) (
 	log.Debugf("bundling from remote %s", dialName)
 
 	dialer := &net.Dialer{Timeout: time.Duration(5) * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", dialName, config)
+	dialTLS := b.opts.dialTLS
+	if dialTLS == nil {
+		dialTLS = tls.DialWithDialer
+	}
+	conn, err := dialTLS(dialer, "tcp", dialName, config)
 	var dialError string
 	// If there's an error in tls.Dial, try again with
 	// InsecureSkipVerify to fetch the remote bundle to (re-)bundle
@@ -299,7 +305,7 @@ func (b *Bundler) BundleFromRemote(serverName, ip string, flavor BundleFlavor) (
 		// dial again with InsecureSkipVerify
 		log.Debugf("try again with InsecureSkipVerify.")
 		config.InsecureSkipVerify = true
-		conn, err = tls.DialWithDialer(dialer, "tcp", dialName, config)
+		conn, err = dialTLS(dialer, "tcp", dialName, config)
 		if err != nil {
 			log.Debugf("dial with InsecureSkipVerify failed: %v", err)
 			return nil, errors.Wrap(errors.DialError, errors.Unknown, err)
@@ -712,13 +718,7 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 		}
 	}
 
-	// Check if there is any platform that rejects the chain because of SHA1 deprecation.
-	sha1Msgs := ubiquity.SHA1DeprecationMessages(bundle.Chain)
-	if len(sha1Msgs) > 0 {
-		log.Debug("Populate SHA1 deprecation warning.")
-		statusCode |= errors.BundleNotUbiquitousBit
-		messages = append(messages, sha1Msgs...)
-	}
+	statusCode, messages = addSHA1DeprecationWarnings(statusCode, messages, bundle.Chain)
 
 	bundle.Status = &BundleStatus{ExpiringSKIs: getSKIs(bundle.Chain, expiringCerts), Code: statusCode, Messages: messages, Untrusted: untrusted}
 
@@ -739,6 +739,17 @@ func (b *Bundler) Bundle(certs []*x509.Certificate, key crypto.Signer, flavor Bu
 
 	log.Debugf("bundle complete")
 	return bundle, nil
+}
+
+func addSHA1DeprecationWarnings(statusCode int, messages []string, chain []*x509.Certificate) (int, []string) {
+	sha1Messages := ubiquity.SHA1DeprecationMessages(chain)
+	if len(sha1Messages) == 0 {
+		return statusCode, messages
+	}
+
+	log.Debug("Populate SHA1 deprecation warning.")
+	statusCode |= errors.BundleNotUbiquitousBit
+	return statusCode, append(messages, sha1Messages...)
 }
 
 // checkExpiringCerts returns indices of certs that are expiring within 30 days.

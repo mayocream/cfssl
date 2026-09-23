@@ -41,7 +41,7 @@ For each pair of crypto algorithm X and key size Y, a CA chain is constructed:
 
 Test_root_CA is a RSA cert, inter-L1 is RSA 4096 cert, inter-L2 is ecdsa-384 cert.
 
-The max path length is set to be 1 for non-root CAs.
+The max path length is 1 for inter-L1 and 0 for inter-L2.
 Two inter-* certs are assembled in intermediates.crt
 
 There is also an expired L1 cert, sharing the same CSR with inter-L1. Also the
@@ -207,8 +207,8 @@ var fileTests = []fileTest{
 		intBundleFile: testCFSSLIntBundle,
 		errorCallback: ExpectErrorMessage(`"code":1220`),
 	},
-	// Expect TooManyIntermediates error because max path length is 1 for
-	// inter-L1 but the leaflet cert is 2 CA away from inter-L1.
+	// Expect TooManyIntermediates because leafRSA4096 becomes an intermediate
+	// below inter-L2, whose max path length is 0.
 	{
 		cert:               leafletRSA4096,
 		extraIntermediates: leafRSA4096,
@@ -366,5 +366,26 @@ func TestBundleFromFile(t *testing.T) {
 				t.Fatal("bundle should fail with no cert")
 			}
 		}
+	}
+}
+
+func TestIntermediateFixturePathLengthConstraints(t *testing.T) {
+	tests := []struct {
+		name           string
+		filename       string
+		wantMaxPathLen int
+		wantZero       bool
+	}{
+		{name: "L1", filename: interL1, wantMaxPathLen: 1},
+		{name: "L2", filename: interL2, wantMaxPathLen: 0, wantZero: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cert := readCert(test.filename)
+			if cert.MaxPathLen != test.wantMaxPathLen || cert.MaxPathLenZero != test.wantZero {
+				t.Fatalf("%s path length is (%d, zero=%t), want (%d, zero=%t)", test.filename, cert.MaxPathLen, cert.MaxPathLenZero, test.wantMaxPathLen, test.wantZero)
+			}
+		})
 	}
 }

@@ -180,9 +180,9 @@ func TestChainKeyAlgoUbiquity(t *testing.T) {
 }
 
 func TestChainExpiryUbiquity(t *testing.T) {
-	// rsa1024Cert expires at year 2024
-	// rsa2048Cert expires at year 2019
-	// ecdsa256Cert expires at year 2019
+	// rsa1024Cert expires at year 2034
+	// rsa2048Cert expires at year 2029
+	// ecdsa256Cert expires at year 2029
 	chain1 := []*x509.Certificate{ecdsa256Cert, rsa2048Cert}
 	chain2 := []*x509.Certificate{ecdsa256Cert, rsa1024Cert}
 
@@ -204,10 +204,10 @@ func TestChainExpiryUbiquity(t *testing.T) {
 }
 
 func TestCompareChainExpiry(t *testing.T) {
-	// rsa1024Cert expires at 2024
-	// rsa2048Cert expires at 2019
-	// ecdsa256Cert expires at 2019
-	// both chain expires at year 2019.
+	// rsa1024Cert expires at 2034
+	// rsa2048Cert expires at 2029
+	// ecdsa256Cert expires at 2029
+	// both chain expire at year 2029.
 	chain1 := []*x509.Certificate{ecdsa256Cert, rsa2048Cert}
 	chain2 := []*x509.Certificate{ecdsa256Cert, rsa1024Cert}
 	if CompareChainExpiry(chain1, chain2) != 0 {
